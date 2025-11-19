@@ -1,0 +1,87 @@
+name: Terraform Destroy - Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy-production" to confirm destruction of production infrastructure.'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: '1.11.2'
+  AWS_REGION: 'us-east-1'
+  ENVIRONMENT: 'prod'
+  PROJECT_NAME: ecommerce
+
+
+jobs:
+  destroy:
+    name: Destroy Production Infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event.inputs.confirm == 'destroy-production'
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformDestroyProd
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Configure kubectl
+        continue-on-error: true
+        run: |
+          CLUSTER_NAME="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}"
+          echo "Configuring kubectl for cluster: $CLUSTER_NAME"
+          
+          aws eks update-kubeconfig \
+            --name $CLUSTER_NAME \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Test kubectl access
+        run: kubectl get ns
+      
+      - name: Cleanup PVCs, Pods and Namespaces
+        continue-on-error: true
+        run: |
+          echo "Deleting all pods and namespaces in logging and monitoring..."
+
+          for ns in logging monitoring; do
+            echo "Processing namespace: $ns"
+
+            # Delete all pods in the namespace (ignore errors if none exist)
+            PODS=$(kubectl get pods -n $ns --no-headers 2>/dev/null | awk '{print $1}')
+            if [ ! -z "$PODS" ]; then
+              echo "Deleting pods in $ns..."
+              for pod in $PODS; do
+                kubectl delete pod $pod -n $ns --force --grace-period=0 || true
+              done
+            fi
+
+            # Delete the namespace itself
+            NS_EXIST=$(kubectl get ns $ns --no-headers 2>/dev/null || echo "")
+            if [ ! -z "$NS_EXIST" ]; then
+              echo "Deleting namespace $ns..."
+              kubectl delete ns $ns --force --grace-period=0 || true
+            fi
+          done
+
+
+
+      - name: Terraform Destroy
+        run: terraform destroy -input=false -auto-approve -var-file="tfvars/${{ env.ENVIRONMENT }}-${{ env.AWS_REGION }}.tfvars"
