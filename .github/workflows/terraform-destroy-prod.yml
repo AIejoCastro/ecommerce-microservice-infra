@@ -17,13 +17,13 @@ env:
   ENVIRONMENT: 'prod'
   PROJECT_NAME: ecommerce
 
-
 jobs:
   destroy:
     name: Destroy Production Infrastructure
     runs-on: ubuntu-latest
     environment: production
     if: github.event.inputs.confirm == 'destroy-production'
+
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -47,41 +47,72 @@ jobs:
         continue-on-error: true
         run: |
           CLUSTER_NAME="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}"
-          echo "Configuring kubectl for cluster: $CLUSTER_NAME"
-          
           aws eks update-kubeconfig \
             --name $CLUSTER_NAME \
             --region ${{ env.AWS_REGION }}
 
       - name: Test kubectl access
+        continue-on-error: true
         run: kubectl get ns
-      
+
       - name: Cleanup PVCs, Pods and Namespaces
         continue-on-error: true
         run: |
           echo "Deleting all pods and namespaces in logging and monitoring..."
 
           for ns in logging monitoring; do
-            echo "Processing namespace: $ns"
+            echo "Processing namespace $ns"
 
-            # Delete all pods in the namespace (ignore errors if none exist)
             PODS=$(kubectl get pods -n $ns --no-headers 2>/dev/null | awk '{print $1}')
             if [ ! -z "$PODS" ]; then
-              echo "Deleting pods in $ns..."
               for pod in $PODS; do
                 kubectl delete pod $pod -n $ns --force --grace-period=0 || true
               done
             fi
 
-            # Delete the namespace itself
-            NS_EXIST=$(kubectl get ns $ns --no-headers 2>/dev/null || echo "")
-            if [ ! -z "$NS_EXIST" ]; then
-              echo "Deleting namespace $ns..."
-              kubectl delete ns $ns --force --grace-period=0 || true
-            fi
+            kubectl delete ns $ns --force --grace-period=0 || true
           done
 
+      - name: Wait for cleanup
+        continue-on-error: true
+        run: |
+          for ns in logging monitoring; do
+            for tipo in pods pvc; do
+              for i in {1..30}; do
+                CNT=$(kubectl get $tipo -n $ns --no-headers 2>/dev/null | wc -l)
+                if [ "$CNT" -eq 0 ]; then break; fi
+                sleep 10
+              done
+            done
+          done
 
+          # Esperar namespaces
+          for i in {1..30}; do
+            NSCNT=$(kubectl get ns logging monitoring --no-headers 2>/dev/null | wc -l)
+            if [ "$NSCNT" -eq 0 ]; then break; fi
+            sleep 10
+          done
+
+      - name: Force delete leftover ENIs
+        continue-on-error: true
+        run: |
+          CLUSTER_TAG="kubernetes.io/cluster/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}"
+
+          ENI_IDS=$(aws ec2 describe-network-interfaces \
+            --filters Name=tag-key,Values=$CLUSTER_TAG \
+            --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+            --output text)
+
+          if [ -z "$ENI_IDS" ]; then
+            echo "No leftover ENIs."
+          else
+            echo "Deleting ENIs: $ENI_IDS"
+            for eni in $ENI_IDS; do
+              aws ec2 delete-network-interface \
+                --network-interface-id $eni \
+                --region ${{ env.AWS_REGION }} || true
+            done
+          fi
 
       - name: Terraform Destroy
         run: terraform destroy -input=false -auto-approve -var-file="tfvars/${{ env.ENVIRONMENT }}-${{ env.AWS_REGION }}.tfvars"
