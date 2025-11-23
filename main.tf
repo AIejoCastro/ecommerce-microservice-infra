@@ -32,7 +32,6 @@ module "compute" {
   depends_on = [module.network]
 }
 
-# Observability Module - TEMPORARILY DISABLED DUE TO HELM SYNTAX ISSUES
 module "observability" {
   source = "./modules/observability"
   
@@ -48,6 +47,9 @@ module "observability" {
   elasticsearch_node_count            = var.elasticsearch_node_count
   elasticsearch_storage_size          = var.elasticsearch_storage_size
   elasticsearch_retention_days        = var.elasticsearch_retention_days
+  alb_controller_role_arn = module.compute.alb_controller_role_arn
+  vpc_id              = module.network.vpc_id
+
   
   tags = local.common_tags
   

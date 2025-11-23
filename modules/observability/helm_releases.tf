@@ -172,14 +172,31 @@ resource "helm_release" "filebeat" {
   ]
 }
 
+resource "kubernetes_service_account" "aws_load_balancer_controller" {
+  metadata {
+    name      = "aws-load-balancer-controller"
+    namespace = "kube-system"
+    
+    annotations = {
+      "eks.amazonaws.com/role-arn" = var.alb_controller_role_arn
+    }
 
-# AWS Load Balancer Controller
+    labels = {
+      "app.kubernetes.io/name"      = "aws-load-balancer-controller"
+      "app.kubernetes.io/component" = "controller"
+    }
+  }
+}
+
+
+
 resource "helm_release" "aws_load_balancer_controller" {
   name       = "aws-load-balancer-controller"
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
   version    = "1.6.2"
   namespace  = "kube-system"
+
   set = [
     {
       name  = "clusterName"
@@ -191,20 +208,60 @@ resource "helm_release" "aws_load_balancer_controller" {
     },
     {
       name  = "vpcId"
-      value = ""  # Auto-detected by the controller
+      value = var.vpc_id
     },
     {
       name  = "serviceAccount.create"
-      value = "true"
+      value = "false"
     },
     {
       name  = "serviceAccount.name"
-      value = "aws-load-balancer-controller"
+      value = kubernetes_service_account.aws_load_balancer_controller.metadata[0].name
     },
     {
-      name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-      value = var.oidc_provider_arn  # Note: This should reference the actual IAM role ARN from compute module
+      name  = "replicaCount"
+      value = var.environment == "prod" ? "2" : "1"
+    },
+    {
+      name  = "resources.requests.cpu"
+      value = "100m"
+    },
+    {
+      name  = "resources.requests.memory"
+      value = "200Mi"
+    },
+    {
+      name  = "resources.limits.cpu"
+      value = var.environment == "prod" ? "300m" : "200m"
+    },
+    {
+      name  = "resources.limits.memory"
+      value = "500Mi"
+    },
+    {
+      name  = "logLevel"
+      value = var.environment == "prod" ? "info" : "debug"
+    },
+    {
+      name  = "enableServiceMutatorWebhook"
+      value = "true"
+    },
+    {
+      name  = "enableShield"
+      value = "false"
+    },
+    {
+      name  = "enableWaf"
+      value = "false"
+    },
+    {
+      name  = "enableWafv2"
+      value = "false"
     }
+  ]
+
+  depends_on = [
+    kubernetes_service_account.aws_load_balancer_controller
   ]
 }
 
@@ -225,5 +282,76 @@ resource "helm_release" "aws_ebs_csi_driver" {
       name  = "controller.serviceAccount.name"
       value = "ebs-csi-controller-sa"
     }
+  ]
+}
+
+resource "null_resource" "ensure_helm_cleanup" {
+  triggers = {
+    cluster_name = var.cluster_name
+    region       = var.region
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOF
+      #!/bin/bash
+      set -e
+      
+      echo "=== Starting Helm cleanup verification ==="
+      
+      # Configurar kubectl
+      aws eks update-kubeconfig \
+        --name ${self.triggers.cluster_name} \
+        --region ${self.triggers.region} 2>/dev/null || true
+      
+      # Esperar a que Helm termine de eliminar recursos
+      echo "Waiting for Helm releases to be fully removed..."
+      sleep 120
+      
+      # Verificar y eliminar PVCs manualmente si aún existen
+      for ns in monitoring logging; do
+        if kubectl get namespace $ns &>/dev/null; then
+          echo "Checking PVCs in namespace: $ns"
+          
+          PVCS=$(kubectl get pvc -n $ns --no-headers 2>/dev/null | awk '{print $1}' || echo "")
+          if [ ! -z "$PVCS" ]; then
+            echo "Deleting remaining PVCs in $ns..."
+            kubectl delete pvc --all -n $ns --timeout=300s --wait=true || true
+          fi
+        fi
+      done
+      
+      # Verificar LoadBalancers
+      echo "Checking for LoadBalancer services..."
+      LB_SERVICES=$(kubectl get svc --all-namespaces -o json 2>/dev/null | \
+        jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace)/\(.metadata.name)"' || echo "")
+      
+      if [ ! -z "$LB_SERVICES" ]; then
+        echo "Deleting LoadBalancer services..."
+        echo "$LB_SERVICES" | while read svc; do
+          NS=$(echo $svc | cut -d/ -f1)
+          NAME=$(echo $svc | cut -d/ -f2)
+          kubectl delete svc $NAME -n $NS --timeout=300s --wait=true || true
+        done
+      fi
+      
+      # Esperar adicional para que AWS libere ENIs
+      echo "Waiting for AWS to release ENIs..."
+      sleep 120
+      
+      echo "=== Helm cleanup verification completed ==="
+    EOF
+    
+    interpreter = ["/bin/bash", "-c"]
+  }
+
+  depends_on = [
+    helm_release.kube_prometheus_stack,
+    helm_release.elasticsearch,
+    helm_release.kibana,
+    helm_release.logstash,
+    helm_release.filebeat,
+    helm_release.aws_load_balancer_controller,
+    helm_release.aws_ebs_csi_driver
   ]
 }
