@@ -67,3 +67,8 @@ output "alb_controller_role_arn" {
   description = "IAM role ARN for AWS Load Balancer Controller"
   value       = aws_iam_role.alb_controller.arn
 }
+
+output "alb_security_group_id" {
+  description = "ID of the ALB security group"
+  value       = aws_security_group.alb.id
+}
